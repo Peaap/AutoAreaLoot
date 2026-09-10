@@ -11,6 +11,8 @@ AutoAreaLoot automatically loots nearby corpses when it is safe to do so.
 - Coalesces blocked triggers into one pending loot pass
 - Runs one final pass after combat when a combat-time trigger occurred
 - Avoids interrupting manual loot windows
+- Defers loot while the player is casting or channeling, resuming the same
+  filtered corpse after the spell ends
 - Preserves new death requests received during an active loot walk
 - Coalesces same-area movement stops into the active walk, while preserving one
   follow-up after moving into a new loot area even if the active walk succeeds

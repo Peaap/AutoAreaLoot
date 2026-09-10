@@ -61,6 +61,7 @@ local state = {
     lootWalkActive = false,
     lootWalkStartedAt = nil,
     itemLootQueue = nil,
+    playerCasting = false,
     useSpeedMovement = false,
     movementStateKnown = false,
     movementSampleElapsed = 0,
@@ -1605,6 +1606,10 @@ local function IsPlayerCurrentlyMoving()
     return state.playerMoving and true or false
 end
 
+local function IsPlayerCasting()
+    return state.playerCasting and true or false
+end
+
 local function GetUnitWorldPosition(unit)
     if type(UnitPosition) ~= "function" then return nil end
     local ok, first, second, third = pcall(UnitPosition, unit)
@@ -1693,6 +1698,11 @@ end
 
 AdvanceFilteredLootCorpse = function(queue, reason)
     if state.itemLootQueue ~= queue then return end
+    if queue.paused or IsPlayerCasting() then
+        queue.paused = true
+        DebugLog("Filtered corpse walk paused for spell cast; reason=" .. reason)
+        return
+    end
     if queue.current then
         DebugLog("Filtered corpse completed: guid="
             .. ShortCorpseGuid(queue.current.guid) .. " reason=" .. reason)
@@ -1724,8 +1734,30 @@ AdvanceFilteredLootCorpse = function(queue, reason)
     end)
 end
 
+local function PauseFilteredLootForCast()
+    local queue = state.itemLootQueue
+    if not queue or queue.paused then return end
+    queue.paused = true
+    if queue.current then
+        queue.current.openToken = nil
+        queue.current.closeToken = nil
+        queue.current = nil
+    end
+    DebugLog("Filtered corpse walk paused for spell cast")
+    if type(CloseLoot) == "function" then pcall(CloseLoot) end
+end
+
+local function ResumeFilteredLootAfterCast()
+    local queue = state.itemLootQueue
+    if not queue or not queue.paused or IsPlayerCasting() then return end
+    queue.paused = nil
+    DebugLog("Filtered corpse walk resuming after spell cast")
+    AdvanceFilteredLootCorpse(queue, "cast complete")
+end
+
 local function HandleFilteredLootOpened()
     local queue = state.itemLootQueue
+    if queue and queue.paused then return true end
     local corpse = queue and queue.current or nil
     if not corpse or corpse.opened then return false end
 
@@ -1762,7 +1794,9 @@ end
 
 local function HandleFilteredLootClosed()
     local queue = state.itemLootQueue
-    if not queue or not queue.current then return false end
+    if not queue then return false end
+    if queue.paused then return true end
+    if not queue.current then return false end
     AdvanceFilteredLootCorpse(queue, "loot closed")
     return true
 end
@@ -1846,6 +1880,12 @@ local function LootNearbyCorpses(source)
     if IsPlayerCurrentlyMoving() then
         QueuePendingLootRequest(source)
         DebugLog("Loot request deferred: player is moving; source=" .. source)
+        return false
+    end
+
+    if IsPlayerCasting() then
+        QueuePendingLootRequest(source)
+        DebugLog("Loot request deferred: player is casting; source=" .. source)
         return false
     end
 
@@ -2362,6 +2402,12 @@ eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
 eventFrame:RegisterEvent("CHAT_MSG_LOOT")
 eventFrame:RegisterEvent("PLAYER_MONEY")
+eventFrame:RegisterEvent("SPELLCAST_START")
+eventFrame:RegisterEvent("SPELLCAST_STOP")
+eventFrame:RegisterEvent("SPELLCAST_FAILED")
+eventFrame:RegisterEvent("SPELLCAST_INTERRUPTED")
+eventFrame:RegisterEvent("SPELLCAST_CHANNEL_START")
+eventFrame:RegisterEvent("SPELLCAST_CHANNEL_STOP")
 if IsEventAvailable("LOOT_SCAN_COMPLETED") then
     eventFrame:RegisterEvent("LOOT_SCAN_COMPLETED")
 end
@@ -2400,6 +2446,7 @@ eventFrame:SetScript("OnEvent", function()
         state.lootWalkActive = false
         state.lootWalkStartedAt = nil
         state.itemLootQueue = nil
+        state.playerCasting = false
         state.playerMoving = false
         state.movementStateKnown = false
         state.movementSampleElapsed = 0
@@ -2425,6 +2472,20 @@ eventFrame:SetScript("OnEvent", function()
         else
             DebugLog("Combat ended: no deferred loot request")
         end
+        return
+    end
+
+    if event == "SPELLCAST_START" or event == "SPELLCAST_CHANNEL_START" then
+        state.playerCasting = true
+        PauseFilteredLootForCast()
+        return
+    end
+
+    if event == "SPELLCAST_STOP" or event == "SPELLCAST_FAILED"
+        or event == "SPELLCAST_INTERRUPTED" or event == "SPELLCAST_CHANNEL_STOP" then
+        state.playerCasting = false
+        ResumeFilteredLootAfterCast()
+        ServicePendingLootRequest()
         return
     end
 
