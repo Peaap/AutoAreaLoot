@@ -11,8 +11,6 @@ AutoAreaLoot automatically loots nearby corpses when it is safe to do so.
 - Coalesces blocked triggers into one pending loot pass
 - Runs one final pass after combat when a combat-time trigger occurred
 - Avoids interrupting manual loot windows
-- Defers loot while the player is casting or channeling, resuming the same
-  filtered corpse after the spell ends
 - Preserves new death requests received during an active loot walk
 - Coalesces same-area movement stops into the active walk, while preserving one
   follow-up after moving into a new loot area even if the active walk succeeds
@@ -24,13 +22,10 @@ AutoAreaLoot automatically loots nearby corpses when it is safe to do so.
   are not dependent on forward/back movement events
 - Uses a bounded latency-adjusted settling period after successful walks,
   avoiding rescans while loot is still being delivered
-- Uses `C_Loot.ScanNearbyLoot()`, `C_Loot.LootUnit()`, and
-  `C_Loot.LootUnitItem()` for optional
-  item filtering: whitelist/blacklist item IDs, minimum quality, and
-  comma-separated include/exclude name text while still collecting coin from
-  each scanned corpse
+- Uses `C_Loot.ScanNearbyLoot()` and `C_Loot.LootUnitItem()` for optional
+  item-ID whitelist/blacklist filtering
 - Leaves filters disabled by default, preserving the regular `LootAllCorpses()`
-  behavior; filtered mode still loots coin and takes only accepted item drops
+  behavior; filtered mode takes only accepted item drops
 - `/aal` opens a small settings panel with enable, death, movement-stop, combat,
   and item-filter toggles
 - `/aal log` opens a compact, scrollable session loot log
@@ -54,11 +49,11 @@ AutoAreaLoot automatically loots nearby corpses when it is safe to do so.
 
 AutoAreaLoot requires the `C_Loot.LootAllCorpses` function provided by the ClassicAPI DLL. It checks for that function at runtime and displays a chat message if it is unavailable.
 
-When item filters are enabled, AutoAreaLoot additionally requires
-`C_Loot.ScanNearbyLoot`, `C_Loot.GetLastScanResults`, `C_Loot.LootUnit`, and
-`C_Loot.LootUnitItem`. It opens each scanned corpse in sequence, requests its
-coin with the stock `LootMoney()` call, takes only matching item drops, and
-then advances automatically to the next corpse.
+When item-ID filters are enabled, AutoAreaLoot additionally requires
+`C_Loot.ScanNearbyLoot`, `C_Loot.GetLastScanResults`, and
+`C_Loot.LootUnitItem`. It requests only matching item drops; coin remains on
+filtered corpses because the selective ClassicAPI surface has no direct
+per-corpse money operation.
 
 Nampower is optional. When its `UNIT_DIED` event is available, the addon uses it; otherwise it falls back to `CHAT_MSG_COMBAT_HOSTILE_DEATH`.
 
@@ -88,11 +83,8 @@ Interface/AddOns/AutoAreaLoot
 /aal debug clear
 /aal filter on|off
 /aal filter status
-/aal filter quality <0-7>
 /aal filter whitelist <itemID,itemID,...>
 /aal filter blacklist <itemID,itemID,...>
-/aal filter include <text,text,...>
-/aal filter exclude <text,text,...>
 /aal filter clear
 ```
 
