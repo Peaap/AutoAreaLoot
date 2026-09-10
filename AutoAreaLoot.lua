@@ -32,13 +32,19 @@ local defaults = {
     lootInCombat = true,
     lootCombine = false,
     openLootLogOnLogin = false,
+    itemFilterEnabled = false,
+    filterWhitelist = "",
+    filterBlacklist = "",
+    filterInclude = "",
+    filterExclude = "",
+    filterMinQuality = 0,
     lootLogWidth = 280,
     lootLogHeight = 195,
     lootLogPoint = "CENTER",
     lootLogRelativePoint = "CENTER",
     lootLogX = 0,
     lootLogY = 20,
-    settingsVersion = 6,
+    settingsVersion = 7,
 }
 
 local state = {
@@ -54,6 +60,7 @@ local state = {
     lootRecordByKey = {},
     lootWalkActive = false,
     lootWalkStartedAt = nil,
+    itemLootQueue = nil,
     useSpeedMovement = false,
     movementStateKnown = false,
     movementSampleElapsed = 0,
@@ -1423,6 +1430,106 @@ local function ShowLootLog()
     end
 end
 
+local function ParseItemIDSet(text)
+    local items = {}
+    if type(text) ~= "string" then return items end
+    for itemID in string.gmatch(text, "%d+") do
+        items[tonumber(itemID)] = true
+    end
+    return items
+end
+
+local function ParseFilterTerms(text)
+    local terms = {}
+    if type(text) ~= "string" then return terms end
+    for term in string.gmatch(text, "[^,;\r\n]+") do
+        term = string.lower(string.match(term, "^%s*(.-)%s*$"))
+        if term ~= "" then table.insert(terms, term) end
+    end
+    return terms
+end
+
+local function GetItemQuality(itemID, link)
+    if type(GetItemInfo) == "function" then
+        local ok, name, itemLink, quality = pcall(GetItemInfo, itemID)
+        quality = tonumber(quality)
+        if ok and quality then return quality, name, itemLink end
+    end
+    local color = type(link) == "string" and string.match(link, "|cff(%x%x%x%x%x%x)")
+    local qualityByColor = {
+        ["9d9d9d"] = 0, ["ffffff"] = 1, ["1eff00"] = 2,
+        ["0070dd"] = 3, ["a335ee"] = 4, ["ff8000"] = 5,
+        ["e6cc80"] = 7,
+    }
+    return color and qualityByColor[string.lower(color)] or nil, nil, nil
+end
+
+local function FilterTextMatches(text, terms)
+    if table.getn(terms) == 0 then return false end
+    text = string.lower(text or "")
+    for _, term in ipairs(terms) do
+        if string.find(text, term, 1, true) then return true end
+    end
+    return false
+end
+
+local function ShouldLootScannedItem(item)
+    local itemID = tonumber(item and item.itemID)
+    if not itemID then return false, "invalid item ID" end
+
+    local whitelist = ParseItemIDSet(AutoAreaLootDB.filterWhitelist)
+    local blacklist = ParseItemIDSet(AutoAreaLootDB.filterBlacklist)
+    if blacklist[itemID] then return false, "blacklisted" end
+
+    local quality, name, itemLink = GetItemQuality(itemID, item.link)
+    local label = name or itemLink or item.link or ("item:" .. itemID)
+    if FilterTextMatches(label, ParseFilterTerms(AutoAreaLootDB.filterExclude)) then
+        return false, "name excluded"
+    end
+    if next(whitelist) and not whitelist[itemID] then
+        return false, "not whitelisted"
+    end
+    if not whitelist[itemID] then
+        local minimumQuality = math.max(0, tonumber(AutoAreaLootDB.filterMinQuality) or 0)
+        if minimumQuality > 0 and (not quality or quality < minimumQuality) then
+            return false, "quality below minimum"
+        end
+        local includeTerms = ParseFilterTerms(AutoAreaLootDB.filterInclude)
+        if table.getn(includeTerms) > 0 and not FilterTextMatches(label, includeTerms) then
+            return false, "name not included"
+        end
+    end
+    return true, "accepted"
+end
+
+local function FilterScanResults(results)
+    local filteredResults = {}
+    for _, corpse in ipairs(results or {}) do
+        if type(corpse.guid) == "string" then
+            local filteredCorpse = {
+                guid = corpse.guid,
+                coin = math.max(0, tonumber(corpse.coin) or 0),
+                items = {},
+            }
+            for _, item in ipairs(corpse.items or {}) do
+                local accepted, reason = ShouldLootScannedItem(item)
+                if accepted then
+                    table.insert(filteredCorpse.items, item)
+                    DebugLog("Filtered item accepted: item=" .. item.itemID
+                        .. " corpse=" .. ShortCorpseGuid(corpse.guid))
+                else
+                    DebugLog("Filtered item skipped: item=" .. tostring(item.itemID)
+                        .. " reason=" .. reason)
+                end
+            end
+            if filteredCorpse.coin > 0 or table.getn(filteredCorpse.items) > 0 then
+                table.insert(filteredResults, filteredCorpse)
+            end
+        end
+    end
+    return filteredResults
+end
+
 local function InitializeSettings()
     if type(AutoAreaLootDB) ~= "table" then
         AutoAreaLootDB = {}
@@ -1556,8 +1663,109 @@ local function IsLootScanInProgress()
     return ok and inProgress and true or false
 end
 
+local function HasSelectiveLootAPI()
+    return C_Loot
+        and type(C_Loot.ScanNearbyLoot) == "function"
+        and type(C_Loot.GetLastScanResults) == "function"
+        and type(C_Loot.LootUnit) == "function"
+        and type(C_Loot.LootUnitItem) == "function"
+end
+
 local CompleteActiveLootWalk
 local ScheduleLootRequest
+local ServicePendingLootRequest
+
+local function IsFilteredLootInProgress()
+    return state.itemLootQueue ~= nil
+end
+
+local AdvanceFilteredLootCorpse
+
+local function StartFilteredItemLoot(results)
+    local queue = { corpses = results or {}, nextIndex = 1, current = nil }
+    if table.getn(queue.corpses) == 0 then
+        DebugLog("Filtered scan found no coin or matching item drops")
+        return
+    end
+    state.itemLootQueue = queue
+    AdvanceFilteredLootCorpse(queue, "start")
+end
+
+AdvanceFilteredLootCorpse = function(queue, reason)
+    if state.itemLootQueue ~= queue then return end
+    if queue.current then
+        DebugLog("Filtered corpse completed: guid="
+            .. ShortCorpseGuid(queue.current.guid) .. " reason=" .. reason)
+        queue.current = nil
+        queue.nextIndex = queue.nextIndex + 1
+    end
+
+    local corpse = queue.corpses[queue.nextIndex]
+    if not corpse then
+        state.itemLootQueue = nil
+        DebugLog("Filtered coin-and-item AoE walk completed")
+        if ServicePendingLootRequest then ServicePendingLootRequest() end
+        return
+    end
+
+    queue.current = corpse
+    corpse.opened = nil
+    local openToken = {}
+    corpse.openToken = openToken
+    local openOK, openError = pcall(C_Loot.LootUnit, corpse.guid)
+    DebugLog("Opening filtered corpse: guid=" .. ShortCorpseGuid(corpse.guid)
+        .. " callOK=" .. tostring(openOK)
+        .. " error=" .. tostring(openError))
+    C_Timer.After(4, function()
+        if state.itemLootQueue == queue and queue.current == corpse
+            and corpse.openToken == openToken then
+            AdvanceFilteredLootCorpse(queue, "open timeout")
+        end
+    end)
+end
+
+local function HandleFilteredLootOpened()
+    local queue = state.itemLootQueue
+    local corpse = queue and queue.current or nil
+    if not corpse or corpse.opened then return false end
+
+    corpse.opened = true
+    state.manualLootOpen = false
+    if type(LootMoney) == "function" then
+        local moneyOK, moneyError = pcall(LootMoney)
+        DebugLog("Filtered corpse money request: guid="
+            .. ShortCorpseGuid(corpse.guid) .. " ok=" .. tostring(moneyOK)
+            .. " error=" .. tostring(moneyError))
+    end
+    for _, item in ipairs(corpse.items or {}) do
+        local itemOK, queued = pcall(C_Loot.LootUnitItem, corpse.guid, item.itemID)
+        DebugLog("Filtered corpse item request: item=" .. tostring(item.itemID)
+            .. " guid=" .. ShortCorpseGuid(corpse.guid)
+            .. " ok=" .. tostring(itemOK) .. " queued=" .. tostring(queued))
+    end
+
+    local closeToken = {}
+    corpse.closeToken = closeToken
+    C_Timer.After(0.15, function()
+        if state.itemLootQueue ~= queue or queue.current ~= corpse
+            or corpse.closeToken ~= closeToken then return end
+        if type(CloseLoot) == "function" then pcall(CloseLoot) end
+        C_Timer.After(0.25, function()
+            if state.itemLootQueue == queue and queue.current == corpse
+                and corpse.closeToken == closeToken then
+                AdvanceFilteredLootCorpse(queue, "close timeout")
+            end
+        end)
+    end)
+    return true
+end
+
+local function HandleFilteredLootClosed()
+    local queue = state.itemLootQueue
+    if not queue or not queue.current then return false end
+    AdvanceFilteredLootCorpse(queue, "loot closed")
+    return true
+end
 
 local function NormalizePendingLootReason(source)
     local reason = source
@@ -1681,6 +1889,12 @@ local function LootNearbyCorpses(source)
         end
     end
 
+    if IsFilteredLootInProgress() then
+        QueuePendingLootRequest(source)
+        DebugLog("Loot request deferred: filtered item queue is active")
+        return false
+    end
+
     if IsLootScanInProgress() then
         QueuePendingLootRequest(source)
         DebugLog("Loot request deferred: another ClassicAPI scan is active")
@@ -1711,15 +1925,29 @@ local function LootNearbyCorpses(source)
         return false
     end
 
+    if AutoAreaLootDB.itemFilterEnabled and not HasSelectiveLootAPI() then
+        DebugLog("Loot request stopped: selective ClassicAPI loot API unavailable")
+        DEFAULT_CHAT_FRAME:AddMessage("AutoAreaLoot: item filters require ClassicAPI ScanNearbyLoot, LootUnit, and LootUnitItem.")
+        return false
+    end
+
     state.pendingLootReason = nil
-    local capture = { events = {} }
+    local capture = { events = {}, filtered = AutoAreaLootDB.itemFilterEnabled }
     state.activeCapture = capture
     state.lootWalkActive = true
     state.lootWalkStartedAt = type(GetTime) == "function" and GetTime() or nil
-    DebugLog("Calling C_Loot.LootAllCorpses")
-    local callOK, callResult = pcall(C_Loot.LootAllCorpses)
+    local callOK
+    local callResult
+    if capture.filtered then
+        DebugLog("Calling C_Loot.ScanNearbyLoot for filtered item drops")
+        callOK, callResult = pcall(C_Loot.ScanNearbyLoot)
+    else
+        DebugLog("Calling C_Loot.LootAllCorpses")
+        callOK, callResult = pcall(C_Loot.LootAllCorpses)
+    end
     local started = callOK and callResult and true or false
-    DebugLog("LootAllCorpses returned: callOK=" .. tostring(callOK)
+    DebugLog((capture.filtered and "ScanNearbyLoot" or "LootAllCorpses")
+        .. " returned: callOK=" .. tostring(callOK)
         .. " result=" .. tostring(callResult)
         .. " apiScan=" .. tostring(IsLootScanInProgress()))
     if not started then
@@ -1902,16 +2130,21 @@ CompleteActiveLootWalk = function()
                 DebugLog("Discarded redundant stop/combat follow-up after successful scan")
             end
         end
-        -- Any logging failure ends here and cannot affect looting.
-        local captureOK, captureError = pcall(CompleteLootCapture, capture, results)
+        -- Register only the items this addon will request before the first
+        -- LootUnitItem call, so immediate chat confirmations are not missed.
+        local captureResults = capture.filtered and FilterScanResults(results) or results
+        local captureOK, captureError = pcall(
+            CompleteLootCapture, capture, captureResults)
         if not captureOK then
             DebugLog("Loot logger completion failed: " .. tostring(captureError))
+        elseif capture.filtered then
+            StartFilteredItemLoot(captureResults)
         end
     end
     return true
 end
 
-local function ServicePendingLootRequest()
+ServicePendingLootRequest = function()
     if not state.pendingLootReason then
         DebugLog("No queued loot request to service")
         return
@@ -1926,8 +2159,8 @@ local function ServicePendingLootRequest()
             .. state.pendingLootReason)
         return
     end
-    if state.lootWalkActive or IsLootScanInProgress() then
-        DebugLog("Queued loot request retained behind active scan; source="
+    if state.lootWalkActive or IsLootScanInProgress() or IsFilteredLootInProgress() then
+        DebugLog("Queued loot request retained behind active loot operation; source="
             .. state.pendingLootReason)
         return
     end
@@ -1948,6 +2181,7 @@ local function SetEnabled(enabled)
         state.pendingLootReason = nil
         state.lootAfterCombat = false
         state.lootWalkStartedAt = nil
+        state.itemLootQueue = nil
         state.stopGraceTimer = nil
         state.lastStopLootRequestAt = nil
         state.lastStopPositionX = nil
@@ -1974,6 +2208,7 @@ local function RefreshConfigPanel()
     configFrame.stopCheck:SetChecked(AutoAreaLootDB.lootOnStop)
     configFrame.combatCheck:SetChecked(AutoAreaLootDB.lootInCombat)
     configFrame.openLogCheck:SetChecked(AutoAreaLootDB.openLootLogOnLogin)
+    configFrame.itemFilterCheck:SetChecked(AutoAreaLootDB.itemFilterEnabled)
 end
 
 local function CreateConfigPanel()
@@ -1981,7 +2216,7 @@ local function CreateConfigPanel()
 
     configFrame = CreateFrame("Frame", "AutoAreaLootConfigFrame", UIParent)
     configFrame:SetWidth(260)
-    configFrame:SetHeight(186)
+    configFrame:SetHeight(210)
     configFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 80)
     configFrame:SetFrameStrata("DIALOG")
     configFrame:SetToplevel(true)
@@ -2035,6 +2270,8 @@ local function CreateConfigPanel()
         configFrame, "Allow looting in combat", -116, "lootInCombat")
     configFrame.openLogCheck = CreateCheckButton(
         configFrame, "Open loot log on login/reload", -140, "openLootLogOnLogin")
+    configFrame.itemFilterCheck = CreateCheckButton(
+        configFrame, "Use item filters (see /aal filter)", -164, "itemFilterEnabled")
 
     local logButton = CreateAALButton(configFrame, 118, 18, "Open Loot Log")
     logButton:SetPoint("BOTTOM", configFrame, "BOTTOM", 0, 7)
@@ -2162,6 +2399,7 @@ eventFrame:SetScript("OnEvent", function()
         state.manualLootOpen = false
         state.lootWalkActive = false
         state.lootWalkStartedAt = nil
+        state.itemLootQueue = nil
         state.playerMoving = false
         state.movementStateKnown = false
         state.movementSampleElapsed = 0
@@ -2209,7 +2447,7 @@ eventFrame:SetScript("OnEvent", function()
                 DebugLog("Death trigger marked a post-combat pass")
             end
             if state.stopGraceTimer or state.lootWalkActive
-                or IsLootScanInProgress() then
+                or IsLootScanInProgress() or IsFilteredLootInProgress() then
                 QueuePendingLootRequest("death")
                 DebugLog("Death trigger queued behind active scan or stop grace")
             else
@@ -2222,12 +2460,14 @@ eventFrame:SetScript("OnEvent", function()
     end
 
     if event == "LOOT_OPENED" then
+        if HandleFilteredLootOpened() then return end
         state.manualLootOpen = true
         DebugLog("Manual loot window marked open")
         return
     end
 
     if event == "LOOT_CLOSED" then
+        if HandleFilteredLootClosed() then return end
         state.manualLootOpen = false
         DebugLog("Manual loot window marked closed")
         ServicePendingLootRequest()
@@ -2322,6 +2562,8 @@ SLASH_AUTOAREA_LOOT1 = "/aal"
 SlashCmdList["AUTOAREA_LOOT"] = function(message)
     if not state.initialized then return end
     local command = string.lower(string.match(message or "", "^%s*(.-)%s*$"))
+    local filterAction, filterValue = string.match(command,
+        "^filter%s*(%S*)%s*(.-)%s*$")
 
     if command == "on" then
         SetEnabled(true)
@@ -2337,7 +2579,44 @@ SlashCmdList["AUTOAREA_LOOT"] = function(message)
             .. "; death trigger " .. (AutoAreaLootDB.lootOnDeath and "on" or "off")
             .. "; stop trigger " .. (AutoAreaLootDB.lootOnStop and "on" or "off")
             .. "; combat looting " .. (AutoAreaLootDB.lootInCombat and "on" or "off")
+            .. "; item filters " .. (AutoAreaLootDB.itemFilterEnabled and "on" or "off")
             .. ".")
+    elseif command == "filter" or filterAction == "status" then
+        DEFAULT_CHAT_FRAME:AddMessage("AutoAreaLoot filters are "
+            .. (AutoAreaLootDB.itemFilterEnabled and "enabled" or "disabled")
+            .. "; quality >= " .. AutoAreaLootDB.filterMinQuality
+            .. "; whitelist: " .. (AutoAreaLootDB.filterWhitelist ~= ""
+                and AutoAreaLootDB.filterWhitelist or "none")
+            .. "; blacklist: " .. (AutoAreaLootDB.filterBlacklist ~= ""
+                and AutoAreaLootDB.filterBlacklist or "none") .. ".")
+    elseif filterAction == "on" or filterAction == "off" then
+        AutoAreaLootDB.itemFilterEnabled = filterAction == "on"
+        RefreshConfigPanel()
+        DEFAULT_CHAT_FRAME:AddMessage("AutoAreaLoot: item filters "
+            .. (AutoAreaLootDB.itemFilterEnabled and "enabled." or "disabled."))
+    elseif filterAction == "quality" then
+        local quality = tonumber(filterValue)
+        if quality and quality >= 0 and quality <= 7 and math.floor(quality) == quality then
+            AutoAreaLootDB.filterMinQuality = quality
+            DEFAULT_CHAT_FRAME:AddMessage("AutoAreaLoot: minimum item quality set to "
+                .. quality .. ".")
+        else
+            DEFAULT_CHAT_FRAME:AddMessage("AutoAreaLoot: quality must be an integer from 0 to 7.")
+        end
+    elseif filterAction == "whitelist" or filterAction == "blacklist"
+        or filterAction == "include" or filterAction == "exclude" then
+        local setting = "filter" .. string.upper(string.sub(filterAction, 1, 1))
+            .. string.sub(filterAction, 2)
+        AutoAreaLootDB[setting] = filterValue or ""
+        DEFAULT_CHAT_FRAME:AddMessage("AutoAreaLoot: " .. filterAction
+            .. " filter updated.")
+    elseif filterAction == "clear" then
+        AutoAreaLootDB.filterWhitelist = ""
+        AutoAreaLootDB.filterBlacklist = ""
+        AutoAreaLootDB.filterInclude = ""
+        AutoAreaLootDB.filterExclude = ""
+        AutoAreaLootDB.filterMinQuality = 0
+        DEFAULT_CHAT_FRAME:AddMessage("AutoAreaLoot: item filter rules cleared.")
     elseif command == "log" then
         ShowLootLog()
     elseif command == "debug" or command == "debug on" then
